@@ -1,5 +1,4 @@
 const { Client } = require('@line/bot-sdk');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { createClient } = require('@supabase/supabase-js');
 
 // 1. Credentials & Config (With secure decoded fallbacks)
@@ -17,7 +16,6 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || dec('c2Jfc2VjcmV0X
 const SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK_URL || 'https://script.google.com/macros/s/AKfycbwmaYKfCAE0ck1Cl9k4xC9LBq-BuV7NL7-dWeu34uprcVrgX1i_NCzdpeYtytc0ct_Iww/exec';
 
 const lineClient = new Client(LINE_CONFIG);
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // 2. In-memory Financial State Cache (Persistent baseline as of 15 Oct 2569)
@@ -69,10 +67,28 @@ async function getLiveLoyverseSummary() {
   }
 }
 
-// 4. Helper: Extract Payment Slip with Gemini
+// 4. Helper: Native Fetch to Gemini API (Text Generation)
+async function callGeminiText(prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }]
+    })
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini API Error (${res.status}): ${errText}`);
+  }
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+// 5. Helper: Native Fetch to Gemini API (Image Slip OCR)
 async function extractSlipWithGemini(imageBuffer) {
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-flash-lite-latest' });
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`;
     const prompt = `คุณคือผู้เชี่ยวชาญการอ่านสลิปธนาคารไทย (OCR Payment Slip) 
 ให้สกัดข้อมูลจากภาพสลิปนี้อย่างแม่นยำ 100% ตอบกลับมาเฉพาะ JSON Format นี้เท่านั้น ห้ามมีคำอธิบายอื่น:
 {
@@ -85,15 +101,21 @@ async function extractSlipWithGemini(imageBuffer) {
   "ref_id": "<รหัสอ้างอิงสลิป>"
 }`;
 
-    const imagePart = {
-      inlineData: {
-        data: imageBuffer.toString('base64'),
-        mimeType: 'image/jpeg'
-      }
-    };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inline_data: { mime_type: 'image/jpeg', data: imageBuffer.toString('base64') } }
+          ]
+        }]
+      })
+    });
 
-    const result = await model.generateContent([prompt, imagePart]);
-    const responseText = result.response.text();
+    const data = await res.json();
+    const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
     const cleanJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
     return JSON.parse(cleanJson);
   } catch (err) {
@@ -102,7 +124,7 @@ async function extractSlipWithGemini(imageBuffer) {
   }
 }
 
-// 5. Helper: Generate LINE Flex Message for Slip Allocation
+// 6. Helper: Generate LINE Flex Message for Slip Allocation
 function createSlipFlexMessage(slipData) {
   const amountStr = Number(slipData.amount || 0).toLocaleString('th-TH', { minimumFractionDigits: 2 });
   const receiverStr = slipData.receiver_name || 'ไม่ระบุชื่อผู้รับ';
@@ -202,7 +224,7 @@ function createSlipFlexMessage(slipData) {
   };
 }
 
-// 6. Helper: Generate Voucher Confirmation Flex Message
+// 7. Helper: Generate Voucher Confirmation Flex Message
 function createVoucherConfirmationFlex(voucher) {
   const amtStr = Number(voucher.amount).toLocaleString('th-TH', { minimumFractionDigits: 2 });
   const shopCashStr = Number(storeWallets.shop_cash).toLocaleString('th-TH', { minimumFractionDigits: 2 });
@@ -274,7 +296,7 @@ function createVoucherConfirmationFlex(voucher) {
   };
 }
 
-// 7. Main Webhook Handler (Vercel Serverless Function)
+// 8. Main Webhook Handler (Vercel Serverless Function)
 module.exports = async (req, res) => {
   if (req.method === 'GET') {
     return res.status(200).send('🌸 N\'Alice AI Secretary Bot is active and running perfectly on Vercel!');
@@ -292,13 +314,11 @@ module.exports = async (req, res) => {
   try {
     for (const event of events) {
       const replyToken = event.replyToken;
-      const userId = event.source?.userId;
       console.log(`[Event Received] Type: ${event.type}, ReplyToken: ${replyToken?.substring(0, 10)}...`);
 
       // CASE A: User sent an Image (Slip / Receipt)
       if (event.type === 'message' && event.message.type === 'image') {
         const messageId = event.message.id;
-        
         try {
           const contentUrl = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
           const imgRes = await fetch(contentUrl, {
@@ -385,32 +405,43 @@ module.exports = async (req, res) => {
         }
 
         // 2. Build Gemini Secretary Prompt
-        const model = genAI.getGenerativeModel({ model: 'gemini-flash-lite-latest' });
         const systemPrompt = `คุณคือ 'น้องอลิซ' (N'Alice) เลขาการเงินส่วนตัวระดับ CFO ของ 'เฮีย' (เจ้าของร้าน Vapor Store & Hub เชียงใหม่)
 บุคลิก: น่ารัก สุภาพ พูดจาคล่องแคล่ว มีกาลเทศะ ฉลาดเฉลียวเรื่องตัวเลขและการเงินรอบด้าน 100%
 การเรียก: ให้เรียกผู้ใช้ว่า "เฮีย" เสมอ และแทนตัวเองว่า "อลิซ" หรือ "น้องอลิซ"
 
-สถานะการเงินของร้านปัจจุบัน (ข้อมูลจริง):
-1. เงินสดร้านค้าที่มีอยู่จริง: ฿ ${storeWallets.shop_cash.toLocaleString('th-TH', { minimumFractionDigits: 2 })} (เงินสดหน้าร้าน 1,340 + ในบัญชี 3,810)
-2. งบลงทุนเฟส 2 คงเหลือ: ฿ ${storeWallets.investor_capital.toLocaleString('th-TH', { minimumFractionDigits: 2 })} (งบ 30,000 หัก Relx 50 ตัว 8,590 + Marbo 10k 6,550 แล้ว เหลือพอสั่ง Lego 50 ตัว 11,000.- ได้สบาย)
-3. หนี้ของเฮีย: ฿ ${storeWallets.personal_debt.toLocaleString('th-TH', { minimumFractionDigits: 2 })} (เฮียจ่ายคืนร้านครบถ้วนแล้ว ไม่มีหนี้ค้างคา)
-4. เงินส่วนตัวของเฮียจริง ๆ ที่เหลือใช้: ฿ ${storeWallets.personal_clean_cash.toLocaleString('th-TH', { minimumFractionDigits: 2 })} (จาก 15,500 - ลงขัน 7,575 - ใช้หนี้ 3,724)
-5. เงินลงขันใหม่จากนักลงทุน: ฿ ${storeWallets.investor_new_deposit.toLocaleString('th-TH', { minimumFractionDigits: 2 })}
+ข้อมูลทางการเงินและประวัติการลงทุนของร้าน (ข้อมูลจริงแท้ 100%):
+1. เงินลงทุนเฟส 1 (ตั้งต้นร้าน):
+   - งบลงขันเริ่มต้นของผู้การ (นักลงทุน 45%): ~31,500 บาท
+   - สัดส่วน: ผู้การ 45%, เฮีย 55%
+   - สถานะคืนทุนเฟส 1: สินค้าล็อตแรก (V Plus 16K, Marbo Switch, หัวพอต) ขายหมุนเวียนจนคืนทุนค่าของครบหมดแล้ว ตอนนี้ยอดขายที่ได้คือเงินทุนหมุนเวียนและกำไรล้วนๆ
+2. เงินลงทุนเฟส 2 (ขยายพอร์ตสต๊อก 3 หมื่นบาท):
+   - เงินลงขันก้อนกลาง: 30,000 บาท
+   - สั่งซื้อไปแล้ว 2 บิลเมื่อเช้า:
+     * บิล 1: Relx Smash Go 50 ตัว (8,590 บาท)
+     * บิล 2: Marbo 10K 30 ตัว + ส่ง (6,550 บาท)
+     * รวมใช้ไป: 15,140 บาท
+   - งบลงทุนเฟส 2 คงเหลือปัจจุบัน: ฿ 14,860.00 (สำรองไว้รอสั่งซื้อ Lego 50 ตัว 11,000 บาท และ Marbo แท้)
+3. เงินลงขันเพิ่มล่าสุดวันนี้:
+   - นักลงทุนเพิ่งโอนเงินลงขันเพิ่มมาอีก: ฿ 7,575.00
+   - เฮียต้องลงขันคู่กันอีก: ฿ 7,575.00
+4. สถานะหนี้ของเฮีย:
+   - หนี้ 3,724 บาท เฮียจ่ายคืนเข้าบัญชีร้านครบถ้วน 100% เรียบร้อยแล้ว ยอดหนี้คงค้างปัจจุบันคือ ฿ 0.00 บาท (ไม่มีหนี้ค้างคา)
+5. เงินสดร้านค้าที่มีอยู่จริง:
+   - รวม ฿ 5,150.00 บาท (เงินสดหน้าร้าน 1,340 + ในบัญชีร้าน 3,810)
+6. เงินส่วนตัวของเฮียจริง ๆ ที่เหลือใช้:
+   - ฿ 4,201.00 บาท (จากเงินในบัญชีเดิม 15,500 - ลงขันเพิ่ม 7,575 - จ่ายหนี้ร้าน 3,724)
 ${salesContext}
 
 หน้าที่ของคุณ:
 - ตอบคำถามของเฮียอย่างตรงประเด็น รวดเร็ว ชัดเจน มีตัวเลขประกอบเสมอ
-- ถ้าเฮียถามเรื่องเงินร้าน, ยอดขาย, สต๊อก, หรือหนี้ ให้ตอบตัวเลขจริงตามสถานะข้างบนอย่างมั่นใจ
 - ให้คำตอบสั้นกระชับ สรุปง่ายๆ เหมาะกับการอ่านใน LINE (ความยาวไม่เกิน 2-4 ย่อหน้า ไม่เยิ่นเย้อ)`;
 
         let replyText = '';
         try {
-          const chatResult = await model.generateContent([
-            { role: 'user', parts: [{ text: `${systemPrompt}\n\nข้อความจากเฮีย: "${userText}"` }] }
-          ]);
-          replyText = chatResult.response.text();
+          const fullPrompt = `${systemPrompt}\n\nข้อความจากเฮีย: "${userText}"\n\nคำตอบของน้องอลิซ:`;
+          replyText = await callGeminiText(fullPrompt);
         } catch (mErr) {
-          console.error('[Gemini Generation Error]:', mErr);
+          console.error('[Gemini Generation Error]:', mErr.message);
           replyText = `สวัสดีค่ะเฮีย! ตอนนี้น้องอลิซพร้อมดูแลบัญชีแล้วค่ะ สถานะเงินร้านตอนนี้เหลืออยู่ ฿ ${storeWallets.shop_cash.toLocaleString()} บาท และงบลงทุนเฟส 2 เหลือ ฿ ${storeWallets.investor_capital.toLocaleString()} บาทค่ะเฮีย!`;
         }
 
@@ -421,7 +452,7 @@ ${salesContext}
           });
           console.log('[LINE Reply Sent Successfully]');
         } catch (lineErr) {
-          console.error('[LINE Reply Error]:', lineErr.message, lineErr.originalError?.response?.data);
+          console.error('[LINE Reply Error]:', lineErr.message);
         }
       }
     }
