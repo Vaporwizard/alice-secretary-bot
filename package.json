@@ -1,0 +1,12 @@
+{
+  "name": "alice-secretary-bot",
+  "version": "1.0.0",
+  "description": "N'Alice - Executive AI CFO Secretary for Vapor Store on Vercel & LINE",
+  "main": "api/webhook.js",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "@line/bot-sdk": "^9.6.0",
+    "@supabase/supabase-js": "^2.116.0",
+    "dotenv": "^16.4.7"
+  }
+}
